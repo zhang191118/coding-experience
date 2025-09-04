@@ -113,34 +113,33 @@ GET请求也可以携带查询参数,参数会被自动编码并附加在URL后�
 package main
 
 import (
-    "fmt"
-    "net/http"
-    "html/template"
+	"fmt"
+	"net/http"
 )
 
 func main() {
-    // 处理POST请求
-    http.HandleFunc("/submit", func(w http.ResponseWriter, r *http.Request) {
-        if r.Method == "POST" {
-            // 解析表单数据
-            err := r.ParseForm()
-            if err != nil {
-                http.Error(w, "Failed to parse form", http.StatusBadRequest)
-                return
-            }
-            
-            // 获取表单字段值
-            username := r.FormValue("username")
-            password := r.FormValue("password")
-            
-            // 处理逻辑
-            fmt.Fprintf(w, "Username: %s, Password: %s", username, password)
-        }
-    })
-    
-    // 启动服务器
-    fmt.Println("Server starting on :8080")
-    http.ListenAndServe(":8080", nil)
+	// 处理POST请求
+	http.HandleFunc("/submit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			// 解析表单数据
+			err := r.ParseForm()
+			if err != nil {
+				http.Error(w, "Failed to parse form", http.StatusBadRequest)
+				return
+			}
+
+			// 获取表单字段值
+			username := r.FormValue("username")
+			password := r.FormValue("password")
+
+			// 处理逻辑
+			fmt.Fprintf(w, "Username: %s, Password: %s", username, password)
+		}
+	})
+
+	// 启动服务器
+	fmt.Println("Server starting on :8080")
+	http.ListenAndServe(":8080", nil)
 }
 ```
 
@@ -188,17 +187,69 @@ headers = {
 
 在网络通信或任务执行中，设置合理的超时机制是保障系统稳定性的第一步。通过限制单次请求的等待时间，可以有效避免线程阻塞和资源浪费。例如：
 
-```python
-import requests
+```go
+package main
 
-try:
-    response = requests.get("https://api.example.com/data", timeout=5)  # 设置5秒超时
-except requests.Timeout:
-    print("请求超时，稍后将重试")
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "time"
+)
+
+// 带重试机制的HTTP请求函数
+func requestWithRetry(url string, maxRetries int) (*http.Response, error) {
+    var resp *http.Response
+    var err error
+    
+    for i := 0; i <= maxRetries; i++ {
+        // 创建带超时的上下文
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        
+        // 创建请求
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil {
+            cancel()
+            return nil, reqErr
+        }
+        
+        // 发起请求
+        client := &http.Client{}
+        resp, err = client.Do(req)
+        cancel()
+        
+        // 如果请求成功，直接返回
+        if err == nil && resp.StatusCode == http.StatusOK {
+            return resp, nil
+        }
+        
+        // 如果还有重试机会，等待一段时间后重试
+        if i < maxRetries {
+            // 指数退避算法：等待时间翻倍
+            waitTime := time.Duration(1<<uint(i)) * time.Second
+            fmt.Printf("请求失败，%v后进行第%d次重试...\n", waitTime, i+1)
+            time.Sleep(waitTime)
+        }
+    }
+    
+    return resp, err
+}
+
+func main() {
+    resp, err := requestWithRetry("https://api.example.com/data", 3)
+    if err != nil {
+        fmt.Println("请求最终失败:", err)
+        return
+    }
+    defer resp.Body.Close()
+    
+    fmt.Println("请求成功，状态码:", resp.StatusCode)
+}
+
 ```
 
 
-上述代码中，`timeout=5`表示如果5秒内未收到响应，则抛出Timeout异常，便于后续处理。
+上述代码中，`5*time.Second`表示如果5秒内未收到响应，则抛出Timeout异常，便于后续处理。
 
 在超时或网络波动场景下，加入重试策略可以进一步提升系统的容错能力。常见的做法是使用指数退避算法控制重试间隔，避免雪崩效应：
 
