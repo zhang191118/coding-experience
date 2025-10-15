@@ -265,7 +265,6 @@ go tool pprof http://localhost:6060/debug/pprof/heap
 `pprof` 的火焰图（flame graph）更是直观，它能清晰地展示出 CPU 的消耗路径。
 
 
-![pprof火焰图示例](https://raw.githubusercontent.com/uber/go-torch/master/example.svg)
 
 
 有了 `pprof` 提供的线索，我们迅速更换了一个支持流式写入的库，问题迎刃而解。

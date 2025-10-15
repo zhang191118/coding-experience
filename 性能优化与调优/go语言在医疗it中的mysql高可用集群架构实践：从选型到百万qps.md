@@ -1,4 +1,6 @@
-Go语言在医疗IT中的MySQL高可用集群架构实践：从选型到百万QPS---大家好，我是阿亮。我在医疗信息技术（Health IT）这个行业摸爬滚打了 8 年多，主要工作是带队构建我们公司的核心业务系统，比如电子临床试验数据采集系统（EDC）、患者报告结果系统（ePRO）以及一系列的医院和临床研究管理平台。
+Go语言在医疗IT中的MySQL高可用集群架构实践：从选型到百万QPS
+
+大家好，我是阿亮。我在医疗信息技术（Health IT）这个行业摸爬滚打了 8 年多，主要工作是带队构建我们公司的核心业务系统，比如电子临床试验数据采集系统（EDC）、患者报告结果系统（ePRO）以及一系列的医院和临床研究管理平台。
 
 这些系统有一个共同的特点：对数据的**准确性、安全性和可用性**要求极高。一条错误的患者数据、一次系统宕机，都可能带来无法估量的后果。今天，我想结合我们团队在实际项目中踩过的坑和积累的经验，跟大家聊聊如何用 Go 语言构建一个能支撑大流量、高可用的 MySQL 数据库集群架构。这篇文章不是纯理论，更多的是我们在一线项目中的实战总结。
 
@@ -504,3 +506,152 @@ log_queries_not_using_indexes = 1 # 记录没有使用索引的查询
 4.  **防护**：利用缓存、限流、熔断等手段，为系统穿上层层“铠甲”。
 
 在医疗 IT 领域，技术方案的选择总是趋于保守和稳健，但技术的演进又要求我们不断拥抱变化。希望我今天的分享，能帮助大家在理论和实践之间找到一个平衡点，构建出更加稳定、可靠的系统。
+
+
+
+// Goroutine 2: 如果选择开启群聊，则同步IM群组状态
+wg.Add(1)
+go func() {
+defer wg.Done()
+// 使用 defer-recover 捕获此协程中的 panic，防止主程序崩溃
+defer func() {
+if r := recover(); r != nil {
+// 将 panic 转换为 error，以便主协程可以捕获和记录
+rpcErr = gerror.Newf("更新IM群组时发生 Panic: %v", r)
+}
+}()
+
+    // 查询旧的群组信息
+    var oldGroup *entity.ImProjectGroup
+    // 注意：在协程中进行数据库查询，通常建议在协程开始前准备好所有数据。
+    // 但为了逻辑独立性，暂时这样处理。
+    _ = dao.ImProjectGroup.Ctx(ctx).Where(dao.ImProjectGroup.Columns().LectureId, meetingInfo.Id).Scan(&oldGroup)
+
+    // --- 场景1: 之前有群，现在要关闭群 ---
+    if oldGroup != nil && !req.CreateGroup {
+        // a. 调用IM接口解散群组
+        // 假设 comSer.TencentCloudIm() 提供了 DestroyGroup 方法
+        err := comSer.TencentCloudIm().DestroyGroup(ctx, oldGroup.GroupId)
+        if err != nil {
+            // 记录警告，因为主业务已成功，不应因此失败
+            g.Log().Warningf(ctx, "解散旧IM群组(GroupId: %s)失败: %v", oldGroup.GroupId, err)
+        }
+        // b. 从数据库删除群组记录 (这本应在主事务中完成，此处为保持结构一致)
+        _, err = dao.ImProjectGroup.Ctx(ctx).Where(dao.ImProjectGroup.Columns().Id, oldGroup.Id).Delete()
+        if err != nil {
+            g.Log().Warningf(ctx, "从数据库删除旧IM群组记录(GroupId: %s)失败: %v", oldGroup.GroupId, err)
+        }
+        return // 操作完成
+    }
+
+    // --- 场景2: 之前没群，现在要创建群 ---
+    if oldGroup == nil && req.CreateGroup {
+        // a. 创建新群组
+        env := g.Cfg().MustGet(ctx, "server.Env").String()
+        newGroupId := comConsts.ImGroupPrefix + env + "-" + gtime.TimestampMicroStr()
+        vchatName := req.Title
+        if req.GroupName != "" {
+            vchatName = req.GroupName
+        }
+
+        err := comSer.TencentCloudIm().CreateGroup(ctx, &commodel.CreateGroupReq{
+            OwnerAccount:     user.UserUnionid,
+            Type:             "Public",
+            Name:             vchatName,
+            GroupId:          newGroupId,
+            ApplyJoinOption:  "FreeAccess",
+            InviteJoinOption: "FreeAccess",
+        })
+        // 忽略群已存在的错误码(10021)，保证幂等性
+        if err != nil && !gstr.Contains(err.Error(), "10021") {
+            rpcErr = gerror.Wrapf(err, "创建新IM群组(GroupId: %s)失败", newGroupId)
+            return
+        }
+
+        // b. 将新群组信息写入数据库 (同样，这本应在主事务中完成)
+        _, err = dao.ImProjectGroup.Ctx(ctx).Data(g.Map{
+            dao.ImProjectGroup.Columns().LectureId:         req.Id,
+            dao.ImProjectGroup.Columns().GroupId:           newGroupId,
+            dao.ImProjectGroup.Columns().GroupLeaderUserId: user.Id,
+            dao.ImProjectGroup.Columns().GroupName:         vchatName,
+            // ... 其他字段
+        }).Insert()
+        if err != nil {
+            rpcErr = gerror.Wrap(err, "写入新IM群组记录到数据库失败")
+            return
+        }
+
+        // c. 添加所有新成员
+        var memberList []model.AddGroupMemberInfo
+        for _, uid := range newAttendeeIDs {
+            if u, ok := userMap[uid]; ok {
+                memberList = append(memberList, model.AddGroupMemberInfo{MemberAccount: u.UserUnionid})
+            }
+        }
+        if len(memberList) > 0 {
+            err = s.AddGroupMember(ctx, newGroupId, memberList)
+            if err != nil {
+                rpcErr = gerror.Wrapf(err, "为新群组(GroupId: %s)添加成员失败", newGroupId)
+            }
+        }
+        return // 操作完成
+    }
+
+    // --- 场景3: 之前有群，现在仍然有群 (更新群信息和成员) ---
+    if oldGroup != nil && req.CreateGroup {
+        currentGroupId := oldGroup.GroupId
+
+        // a. 更新群名称 (如果改变了)
+        newGroupName := req.Title
+        if req.GroupName != "" {
+            newGroupName = req.GroupName
+        }
+        // 假设 ImProjectGroup 实体有 GroupName 字段
+        if newGroupName != oldGroup.GroupName {
+            // 假设有 ModifyGroupBaseInfo 接口用于修改群名
+            err := comSer.TencentCloudIm().ModifyGroupBaseInfo(ctx, &commodel.ModifyGroupBaseInfoReq{
+                GroupId: currentGroupId,
+                Name:    newGroupName,
+            })
+            if err != nil {
+                g.Log().Warningf(ctx, "更新IM群名称失败(GroupId: %s): %v", currentGroupId, err)
+            }
+        }
+
+        // b. 移除需要删除的成员
+        if len(usersToRemove) > 0 {
+            var membersToRemove []string
+            for _, uid := range usersToRemove {
+                if u, ok := userMap[uid]; ok {
+                    membersToRemove = append(membersToRemove, u.UserUnionid)
+                }
+            }
+            if len(membersToRemove) > 0 {
+                // 假设有 DeleteGroupMember 接口用于删除成员
+                err := comSer.TencentCloudIm().DeleteGroupMember(ctx, &commodel.DeleteGroupMemberReq{
+                    GroupId:            currentGroupId,
+                    MemberToDel_Account: membersToRemove,
+                })
+                if err != nil {
+                    g.Log().Warningf(ctx, "从IM群组(GroupId: %s)移除成员失败: %v", currentGroupId, err)
+                }
+            }
+        }
+
+        // c. 添加新成员
+        if len(usersToAdd) > 0 {
+            var membersToAdd []model.AddGroupMemberInfo
+            for _, uid := range usersToAdd {
+                if u, ok := userMap[uid]; ok {
+                    membersToAdd = append(membersToAdd, model.AddGroupMemberInfo{MemberAccount: u.UserUnionid})
+                }
+            }
+            if len(membersToAdd) > 0 {
+                err := s.AddGroupMember(ctx, currentGroupId, membersToAdd)
+                if err != nil {
+                    g.Log().Warningf(ctx, "向IM群组(GroupId: %s)添加新成员失败: %v", currentGroupId, err)
+                }
+            }
+        }
+    }
+}()
